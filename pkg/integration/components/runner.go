@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	lazycoreUtils "github.com/jesseduffield/lazycore/pkg/utils"
 	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
 	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
 	"github.com/jesseduffield/lazygit/pkg/utils"
@@ -40,9 +39,12 @@ type RunTestArgs struct {
 // showing what's actually happening during the test, but it's still good at running
 // tests in telling you about their results.
 func RunTests(args RunTestArgs) error {
-	projectRootDir := lazycoreUtils.GetLazyRootDirectory()
-	err := os.Chdir(projectRootDir)
+	projectRootDir, err := utils.FindLazygitRootDirectory()
 	if err != nil {
+		return err
+	}
+
+	if err := os.Chdir(projectRootDir); err != nil {
 		return err
 	}
 
@@ -256,14 +258,15 @@ func getLazygitCommand(
 		return nil, err
 	}
 
-	cmdArgs := []string{tempLazygitPath(), "-debug", "--use-config-dir=" + paths.Config()}
-
 	resolvedExtraArgs := lo.Map(test.ExtraCmdArgs(), func(arg string, _ int) string {
 		return utils.ResolvePlaceholderString(arg, map[string]string{
 			"actualPath":     paths.Actual(),
 			"actualRepoPath": paths.ActualRepo(),
 		})
 	})
+
+	cmdArgs := make([]string, 0, 3+len(resolvedExtraArgs))
+	cmdArgs = append(cmdArgs, tempLazygitPath(), "-debug", "--use-config-dir="+paths.Config())
 	cmdArgs = append(cmdArgs, resolvedExtraArgs...)
 
 	// Use a limited environment for test isolation, including pass through

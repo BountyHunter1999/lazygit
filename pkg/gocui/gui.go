@@ -38,6 +38,11 @@ var (
 
 	// ErrKeybindingNotHandled is returned when a keybinding is not handled, so that the key can be dispatched further
 	ErrKeybindingNotHandled = standardErrors.New("keybinding not handled")
+
+	// ErrLoopExited is returned by OnUIThreadAndWait when MainLoop has already
+	// returned. Nothing dequeues user events after that, so the callback it was
+	// asked to run on the main goroutine never will be.
+	ErrLoopExited = standardErrors.New("main loop exited")
 )
 
 const (
@@ -217,6 +222,11 @@ type Gui struct {
 	// worker goroutines, so it's atomic.
 	uiThreadID atomic.Int64
 
+	// focused says whether the terminal we're running in has focus, as far as
+	// its focus reports tell us (see IsFocused). Written by the event loop,
+	// readable from anywhere, so it's atomic.
+	focused atomic.Bool
+
 	// blockInputCount, when greater than zero, withholds keyboard input from
 	// the handlers: key events are buffered into bufferedKeyEvents and replayed
 	// once the count drops back to zero, while mouse clicks and hover are
@@ -300,6 +310,12 @@ func NewGui(opts NewGuiOpts) (*Gui, error) {
 	// callers -- and it means IsUIThread is already correct for the UI work that
 	// runs during startup, before we reach MainLoop.
 	g.uiThreadID.Store(goid.Get())
+
+	// Assume we start out focused: a terminal that supports focus reports sends
+	// one for the state it is already in when we turn reporting on in MainLoop,
+	// and passing that on as a change would have the app react to a change that
+	// never happened.
+	g.focused.Store(true)
 
 	return g, nil
 }
@@ -659,19 +675,15 @@ func (g *Gui) DeleteViewKeybindings(viewname string) {
 }
 
 // SetTabClickBinding sets a binding for a tab click event
-func (g *Gui) SetTabClickBinding(viewName string, handler tabClickHandler) error {
+func (g *Gui) SetTabClickBinding(viewName string, handler tabClickHandler) {
 	g.tabClickBindings = append(g.tabClickBindings, &tabClickBinding{
 		viewName: viewName,
 		handler:  handler,
 	})
-
-	return nil
 }
 
-func (g *Gui) SetViewClickBinding(binding *ViewMouseBinding) error {
+func (g *Gui) SetViewClickBinding(binding *ViewMouseBinding) {
 	g.viewMouseBindings = append(g.viewMouseBindings, binding)
-
-	return nil
 }
 
 // captureMouse routes subsequent mouse events to view until the mouse button is
@@ -893,36 +905,50 @@ func (g *Gui) EndBlockingEvents() error {
 }
 
 // OnUIThreadAndWait runs f on the main event-loop goroutine and blocks the
-// caller until f has run, returning f's error. Use it to read UI-thread-owned
-// state (the model, contexts) from a worker without racing the UI thread.
+// caller until f has run. Use it to read UI-thread-owned state (the model,
+// contexts) from a worker without racing the UI thread.
+//
+// The error it returns is the wait's own, never f's: it reports that f was not
+// run at all, which happens when the main loop has exited (ErrLoopExited). f
+// doesn't report an error because what callers want on the UI thread — reading
+// and mutating state — doesn't fail.
 //
 // It must be called from a worker goroutine, never from the UI thread itself:
 // the UI thread would block waiting for a callback only it can run, which
 // deadlocks. Callers arrange this by construction (see the refresh helper's
 // RefreshFromWorker); a debug-only assertion there guards against getting it
 // wrong.
-func (g *Gui) OnUIThreadAndWait(f func() error) error {
+func (g *Gui) OnUIThreadAndWait(f func()) error {
 	return g.onUIThreadAndWait(f, false)
 }
 
 // Like OnUIThreadAndWait, but the enqueued work belongs to a background routine,
 // so it doesn't count towards the program being busy (see UpdateBackground).
-func (g *Gui) OnUIThreadAndWaitBackground(f func() error) error {
+func (g *Gui) OnUIThreadAndWaitBackground(f func()) error {
 	return g.onUIThreadAndWait(f, true)
 }
 
-func (g *Gui) onUIThreadAndWait(f func() error, background bool) error {
+func (g *Gui) onUIThreadAndWait(f func(), background bool) error {
 	enqueue := g.Update
 	if background {
 		enqueue = g.UpdateBackground
 	}
 
-	result := make(chan error, 1)
+	ran := make(chan struct{})
 	enqueue(func(*Gui) error {
-		result <- f()
+		f()
+		close(ran)
 		return nil
 	})
-	return <-result
+
+	select {
+	case <-ran:
+		return nil
+	case <-g.loopExited:
+		// The queue we just enqueued onto is no longer being served, so waiting
+		// on `ran` here would mean waiting for the rest of the process's life.
+		return ErrLoopExited
+	}
 }
 
 // Calls a function in a goroutine. Handles panics gracefully and tracks
@@ -1246,7 +1272,7 @@ func calcScrollbarRune(
 
 func calcRealScrollbarStartEnd(v *View) (bool, int, int) {
 	height := v.InnerHeight()
-	fullHeight := v.ViewLinesHeight() - v.scrollMargin()
+	fullHeight := v.scrollbarContentHeight() - v.scrollMargin()
 
 	if v.CanScrollPastBottom {
 		fullHeight += height
@@ -1428,7 +1454,7 @@ func (g *Gui) drawTitle(v *View, fgColor, bgColor Attribute) error {
 			currentBgColor = v.BgColor
 		}
 
-		if i >= currentTabStart && i <= currentTabEnd {
+		if i >= currentTabStart && i <= currentTabEnd && g.IsFocused() {
 			currentFgColor = v.SelFgColor
 			if v != g.currentView {
 				currentFgColor &= ^AttrBold
@@ -1467,7 +1493,7 @@ func (g *Gui) drawSubtitle(v *View, fgColor, bgColor Attribute) error {
 
 // drawListFooter draws the footer of a list view, showing something like '1 of 10'
 func (g *Gui) drawListFooter(v *View, fgColor, bgColor Attribute) error {
-	if len(v.lines) == 0 {
+	if len(v.buf.lines) == 0 {
 		return nil
 	}
 
@@ -1589,6 +1615,20 @@ func (g *Gui) ForceFlushViewsContentOnly(views []*View) error {
 	return g.flushContentOnly(views)
 }
 
+// hasFocus reports whether a view is drawn as focused. Views that are embedded
+// in one another (see View.ParentView) form a single unit, so they are all drawn
+// as focused while any one of them is the current view.
+func (g *Gui) hasFocus(v *View) bool {
+	return g.currentView != nil && outermostView(v) == outermostView(g.currentView)
+}
+
+func outermostView(v *View) *View {
+	for v.ParentView != nil {
+		v = v.ParentView
+	}
+	return v
+}
+
 // draw manages the cursor and calls the draw function of a view.
 func (g *Gui) draw(v *View) error {
 	if !v.Visible || v.y1 < v.y0 || v.x1 < v.x0 {
@@ -1609,11 +1649,11 @@ func (g *Gui) draw(v *View) error {
 		Screen.HideCursor()
 	}
 
-	v.draw()
+	v.draw(g.IsFocused())
 
 	if v.Frame {
 		var fgColor, bgColor, frameColor Attribute
-		if g.Highlight && v == g.currentView {
+		if g.Highlight && g.hasFocus(v) && g.IsFocused() {
 			fgColor = g.SelFgColor
 			bgColor = g.SelBgColor
 			frameColor = g.SelFrameColor
@@ -1717,13 +1757,13 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 			if newY < 0 {
 				newY = 0
 				newCy = -v.oy
-			} else if newY >= len(v.lines) {
-				newY = len(v.lines) - 1
+			} else if newY >= len(v.buf.lines) {
+				newY = len(v.buf.lines) - 1
 				newCy = newY - v.oy
 			}
 
 			visibleLineWidth := 0
-			for _, c := range v.lines[newY].cells {
+			for _, c := range v.buf.lines[newY].cells {
 				visibleLineWidth += c.width
 			}
 			if visibleLineWidth < newX {
@@ -1733,10 +1773,8 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 		}
 
 		if ev.Key.KeyName() == MouseLeft && (ev.Key.Mod()&ModMotion) == 0 && !v.Editable && g.openHyperlink != nil {
-			if newY >= 0 && newY <= len(v.viewLines)-1 && newX >= 0 && newX <= len(v.viewLines[newY].line)-1 {
-				if link := v.viewLines[newY].line[newX].hyperlink; link != "" {
-					return g.openHyperlink(link, v.name)
-				}
+			if link := v.hyperlinkAt(newX, newY); link != "" {
+				return g.openHyperlink(link, v.name)
 			}
 		}
 
@@ -1955,7 +1993,7 @@ func (g *Gui) execKeybindings(v *View, ev *GocuiEvent) error {
 			matchingParentViewKb = nil
 			break
 		}
-		if v != nil && g.matchView(v.ParentView, kb) {
+		if matchingParentViewKb == nil && v != nil && g.matchView(v.ParentView, kb) {
 			matchingParentViewKb = kb
 		}
 		if globalKb == nil && kb.viewName == "" {
@@ -1990,7 +2028,21 @@ func (g *Gui) execKeybinding(v *View, kb *keybinding) error {
 	return nil
 }
 
+// IsFocused reports whether the terminal we're running in has focus. Terminals
+// that don't report focus at all leave this true for good.
+func (g *Gui) IsFocused() bool {
+	return g.focused.Load()
+}
+
 func (g *Gui) onFocus(ev *GocuiEvent) error {
+	// Terminals report their focus state when we turn focus reporting on, and
+	// some report it again when their window is activated, so only pass on the
+	// reports that actually change it.
+	if ev.Focused == g.focused.Load() {
+		return nil
+	}
+	g.focused.Store(ev.Focused)
+
 	if g.focusHandler != nil {
 		return g.focusHandler(ev.Focused)
 	}
@@ -2053,13 +2105,15 @@ func (g *Gui) isSuspended() bool {
 	return g.suspended
 }
 
-// matchView returns if the keybinding matches the current view (and the view's context)
+// matchView returns if the keybinding matches the given view (and the view's context)
 func (g *Gui) matchView(v *View, kb *keybinding) bool {
-	// if the user is typing in a field, ignore char keys
 	if v == nil {
 		return false
 	}
-	if v.Editable && kb.key.Str() != "" && kb.key.Mod() == 0 {
+	// If the user is typing in a field, printable keys are theirs to type, so no
+	// keybinding gets a look at them: not the field's own, and not those of the
+	// view it is embedded in either.
+	if field := g.currentView; field != nil && field.Editable && !field.KeybindOnEdit && kb.key.IsPrintable() {
 		return false
 	}
 	if kb.viewName != v.name {
